@@ -1,15 +1,25 @@
 <template>
-  <div class="theater-mode rounded-lg overflow-hidden">
+  <div class="theater-mode rounded-lg overflow-hidden relative">
     <video ref="videoPlayer" class="video-js vjs-default-skin rounded-lg">
       <source :src="initialSrc" type="application/x-mpegURL" />
     </video>
+    <div v-if="debug" class="debug-info">
+      Current Quality: {{ quality }}
+      <br>
+      Current Speed: {{ speed }} Kbps
+      <br>
+      Speed Label: {{ speedLabel }}
+      <br>
+      Recommended Quality: {{ recommendedQuality }}
+    </div>
   </div>
 </template>
 
 <script setup>
-import { onMounted, onBeforeUnmount, ref, computed } from 'vue';
+import { onMounted, onBeforeUnmount, ref, computed, watch } from 'vue';
 import videojs from 'video.js';
 import 'video.js/dist/video-js.css';
+import useInternetSpeed from '~/composables/useInternetSpeed';
 
 const props = defineProps({
   videoid: {
@@ -18,43 +28,82 @@ const props = defineProps({
   }
 });
 
-const DEFAULT_QUALITY = 'high';
+const DEFAULT_QUALITY = 'auto';
 const quality = ref(DEFAULT_QUALITY);
 const videoPlayer = ref(null);
 let player = null;
+let isChangingSource = false;
 
-const initialSrc = computed(() => `../storage/${props.videoid}/${DEFAULT_QUALITY}/output.m3u8`);
+const { speed, speedLabel, recommendedQuality } = useInternetSpeed();
+
+const initialSrc = computed(() => `../storage/${props.videoid}/high/output.m3u8`);
+const lastQualityChange = ref(null);
+const debug = ref(true);
 
 const changeQuality = (newQuality) => {
-  quality.value = newQuality;
-  if (typeof window !== 'undefined') {
-    localStorage.setItem('videoQuality', newQuality);
+  if (isChangingSource) {
+    return;
   }
+
+  if (newQuality === 'auto') {
+    quality.value = 'auto';
+    newQuality = recommendedQuality.value;
+  } else {
+    quality.value = newQuality;
+  }
+
+  if (typeof window !== 'undefined') {
+    localStorage.setItem('videoQuality', quality.value);
+  }
+
   const newSrc = `../storage/${props.videoid}/${newQuality}/output.m3u8`;
   if (player) {
+    isChangingSource = true;
     const currentTime = player.currentTime();
     const isPlaying = !player.paused();
+
     player.src({ type: 'application/x-mpegURL', src: newSrc });
-    player.load();
-    player.currentTime(currentTime);
-    if (isPlaying) {
-      player.play();
-    }
-    // Update the button text
+    player.one('loadedmetadata', () => {
+      player.currentTime(currentTime);
+      if (isPlaying) {
+        player.play().catch(error => {
+          console.error('Error playing video:', error);
+        });
+      }
+      isChangingSource = false;
+    });
+
     const qualityButton = player.getChild('controlBar').getChild('QualityMenuButton');
     if (qualityButton) {
-      qualityButton.updateButtonText(newQuality);
-      qualityButton.updateMenuItems(newQuality);
+      qualityButton.updateButtonText(quality.value);
+      qualityButton.updateMenuItems(quality.value);
     }
   }
+  lastQualityChange.value = newQuality;
 };
 
-// Custom Video.js plugin for quality selection
+watch([recommendedQuality, speedLabel], ([newRecommendedQuality, newSpeedLabel]) => {
+  if (quality.value === 'auto' && !isChangingSource) {
+    let qualityToSet = newRecommendedQuality;
+
+    if (newSpeedLabel === '3G') {
+      if (newRecommendedQuality === 'medium') {
+        qualityToSet = 'low';
+      } else {
+        qualityToSet = 'high';
+      }
+    }
+    if (qualityToSet !== lastQualityChange.value) {
+      changeQuality('auto'); 
+    }
+  }
+});
+
 const qualitySelector = function(options) {
   this.ready(() => {
-    const qualities = ['low', 'medium', 'high'];
+    const qualities = ['auto', 'low', 'medium', 'high'];
     const qualityItems = qualities.map(q => ({
-      label: q.charAt(0).toUpperCase() + q.slice(1),
+      label: q === 'auto' ? 'Auto' : q.charAt(0).toUpperCase() + q.slice(1),
       value: q
     }));
 
@@ -82,7 +131,7 @@ const qualitySelector = function(options) {
       constructor(player, options) {
         super(player, options);
         this.controlText('Quality');
-        this.updateButtonText(quality.value);
+        this.updateButtonText(quality.value); 
       }
 
       createItems() {
@@ -90,13 +139,14 @@ const qualitySelector = function(options) {
           return new QualityMenuItem(this.player_, {
             label: qualityItem.label,
             value: qualityItem.value,
-            selected: qualityItem.value === quality.value
+            selected: qualityItem.value === quality.value 
           });
         });
       }
 
       updateButtonText(qualityLevel) {
-        this.el().querySelector('.vjs-icon-placeholder').textContent = qualityLevel.charAt(0).toUpperCase() + qualityLevel.slice(1);
+        this.el().querySelector('.vjs-icon-placeholder').textContent = 
+          qualityLevel === 'auto' ? 'Auto' : qualityLevel.charAt(0).toUpperCase() + qualityLevel.slice(1);
       }
 
       updateMenuItems(selectedQuality) {
@@ -129,22 +179,25 @@ onMounted(() => {
       if (savedVolume !== null) {
         player.volume(parseFloat(savedVolume));
       }
-      // Load saved quality after mount
-      const savedQuality = localStorage.getItem('videoQuality');
-      if (savedQuality) {
-        changeQuality(savedQuality);
-      }
-    }
-    player.playsinline(true);
-    player.controls(true);
-    player.preload('auto');
-    player.muted(false);
-    player.load();
-    player.on('volumechange', () => {
-      if (typeof window !== 'undefined') {
+
+      const savedQuality = localStorage.getItem('videoQuality') || DEFAULT_QUALITY; // Use saved or default
+      quality.value = savedQuality; 
+      changeQuality(savedQuality); 
+
+      player.playsinline(true);
+      player.controls(true);
+      player.preload('auto');
+      player.muted(false);
+      player.load();
+
+      player.on('volumechange', () => {
         localStorage.setItem('videoPlayerVolume', player.volume());
-      }
-    });
+      });
+
+      player.on('error', (e) => {
+        console.error('Video.js error:', player.error());
+      });
+    }
   });
 });
 
@@ -155,6 +208,7 @@ onBeforeUnmount(() => {
 });
 </script>
 
+
 <style scoped>
 .theater-mode .video-js {
   width: 100% !important;
@@ -162,7 +216,6 @@ onBeforeUnmount(() => {
   transition: height 0.3s ease, width 0.3s ease;
 }
 
-/* Add this new style for the quality selector button */
 :deep(.vjs-quality-selector) {
   font-size: 0.8em;
 }
@@ -173,7 +226,6 @@ onBeforeUnmount(() => {
   line-height: 2.2;
 }
 
-/* Responsive styles remain the same */
 @media (max-width: 1200px) {
   .theater-mode .video-js {
     height: calc(70vh) !important;
